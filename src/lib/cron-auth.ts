@@ -14,10 +14,9 @@ export function verifyCronSecret(request: Request): NextResponse | null {
     return null;
   }
 
-  const auth = request.headers.get("authorization");
+  const auth = request.headers.get("Authorization");
   if (auth !== `Bearer ${secret}`) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
   return null;
 }
-

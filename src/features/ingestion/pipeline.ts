@@ -7,9 +7,15 @@
  */
 
 import { prisma } from "@/lib/db";
-import { INGESTION_BATCH_SIZE, POSTS_PER_SUBREDDIT } from "@/features/shared/config";
+import { POSTS_PER_SUBREDDIT } from "@/features/shared/config";
 import { fetchSubredditPosts } from "./reddit-client";
 import { scorePosts } from "./trend-scorer";
+
+// ─── Tuning ───────────────────────────────────────────────────────────────────
+// 3 subs × 2 Reddit calls = 6 API calls
+// 3 subs × ~37 posts = ~111 upserts → ~2s on Neon
+// Total budget comfortably under 10s
+const INGESTION_BATCH_SIZE = 3;
 
 export interface IngestionResult {
   subredditsProcessed: string[];
@@ -55,8 +61,8 @@ export async function runIngestion(): Promise<IngestionResult> {
   });
 
   const offset = cursor.offset % allSubs.length;
-  const batch = [];
-  for (let i = 0; i < INGESTION_BATCH_SIZE && i + offset < allSubs.length; i++) {
+  const batch: string[] = [];
+  for (let i = 0; i < INGESTION_BATCH_SIZE && offset + i < allSubs.length; i++) {
     batch.push(allSubs[offset + i].name);
   }
 
@@ -91,51 +97,44 @@ export async function runIngestion(): Promise<IngestionResult> {
   let ingested = 0;
   let updated = 0;
 
+  // Use upsert directly — no prior findUnique needed (halves DB round-trips)
   for (const post of scored) {
     // Filter NSFW
     if (post.isNsfw) continue;
 
     try {
-      const existing = await prisma.redditPost.findUnique({
+      const result = await prisma.redditPost.upsert({
         where: { id: post.id },
-        select: { id: true },
+        create: {
+          id: post.id,
+          title: post.title,
+          selftext: post.selftext.slice(0, 5000),
+          author: post.author,
+          upvotes: post.upvotes,
+          comments: post.comments,
+          permalink: post.permalink,
+          url: post.url,
+          flair: post.flair,
+          isNsfw: post.isNsfw,
+          createdAtUtc: new Date(post.createdUtc * 1000),
+          trendScore: post.trendScore,
+          engagementRate: post.engagementRate,
+          ageHours: post.ageHours,
+          subredditName: post.subreddit.toLowerCase(),
+          status: "SCORED",
+        },
+        update: {
+          upvotes: post.upvotes,
+          comments: post.comments,
+          trendScore: post.trendScore,
+          engagementRate: post.engagementRate,
+          ageHours: post.ageHours,
+        },
+        select: { ingestedAt: true, updatedAt: true },
       });
-
-      if (existing) {
-        await prisma.redditPost.update({
-          where: { id: post.id },
-          data: {
-            upvotes: post.upvotes,
-            comments: post.comments,
-            trendScore: post.trendScore,
-            engagementRate: post.engagementRate,
-            ageHours: post.ageHours,
-          },
-        });
-        updated++;
-      } else {
-        await prisma.redditPost.create({
-          data: {
-            id: post.id,
-            title: post.title,
-            selftext: post.selftext.slice(0, 5000),
-            author: post.author,
-            upvotes: post.upvotes,
-            comments: post.comments,
-            permalink: post.permalink,
-            url: post.url,
-            flair: post.flair,
-            isNsfw: post.isNsfw,
-            createdAtUtc: new Date(post.createdUtc * 1000),
-            trendScore: post.trendScore,
-            engagementRate: post.engagementRate,
-            ageHours: post.ageHours,
-            subredditName: post.subreddit.toLowerCase(),
-            status: "SCORED",
-          },
-        });
-        ingested++;
-      }
+      // If ingestedAt ≈ updatedAt, it was just created
+      const isNew = Math.abs(result.ingestedAt.getTime() - result.updatedAt.getTime()) < 1000;
+      if (isNew) ingested++; else updated++;
     } catch (error) {
       // Skip posts that fail (e.g. FK violation if subreddit not yet discovered)
       console.warn(`Failed to upsert post ${post.id}:`, error);
@@ -160,4 +159,3 @@ export async function runIngestion(): Promise<IngestionResult> {
     duration: Date.now() - start,
   };
 }
-

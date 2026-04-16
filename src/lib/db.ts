@@ -7,6 +7,15 @@ declare global {
 }
 
 /**
+ * Normalise the DATABASE_URL for pg compatibility.
+ * pg v9 deprecates 'sslmode=require' — map it to 'sslmode=verify-full'
+ * to silence the SECURITY WARNING and adopt the safer behaviour now.
+ */
+function normaliseDatabaseUrl(raw: string): string {
+  return raw.replace(/sslmode=require(&|$)/, "sslmode=verify-full$1");
+}
+
+/**
  * Returns a singleton PrismaClient using the pg driver adapter (Prisma 7).
  * Lazy — only instantiated on first call, never at module evaluation time.
  * This prevents build-time failures on Vercel where DATABASE_URL is not
@@ -15,9 +24,10 @@ declare global {
 export function getPrisma(): PrismaClient {
   if (globalThis._prisma) return globalThis._prisma;
 
-  const url = process.env.DATABASE_URL;
-  if (!url) throw new Error("DATABASE_URL environment variable is not set");
+  const raw = process.env.DATABASE_URL;
+  if (!raw) throw new Error("DATABASE_URL environment variable is not set");
 
+  const url = normaliseDatabaseUrl(raw);
   const adapter = new PrismaPg(url);
   const client = new PrismaClient({ adapter });
 

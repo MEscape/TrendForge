@@ -1,12 +1,16 @@
 /**
  * Discovery Pipeline
  *
- * Dynamically discovers new subreddits by:
- * 1. Seeding initial subreddits from config
- * 2. Searching Reddit for related communities
- * 3. Scoring each for relevance
- * 4. Storing top ones in DB
- * 5. Pruning low-performers over time
+ * Designed to complete within Vercel's 10s function limit.
+ * Each cron invocation does ONE small unit of work:
+ *
+ *   Phase A — Seed:     Insert up to SEEDS_PER_RUN missing seeds (NO Reddit API calls)
+ *   Phase B — Discover: Run ONE search query, score results, save top candidates
+ *                        (max 2 fetchAbout() calls to stay within budget)
+ *   Phase C — Prune:    Pure DB operation, always runs, always fast
+ *
+ * A cursor in IngestionCursor (reused as "discoverySearchOffset") tracks
+ * which search term to use next so each run advances through the term list.
  */
 
 import { prisma } from "@/lib/db";
@@ -18,7 +22,35 @@ import {
 import { searchSubreddits, fetchSubredditAbout } from "@/features/ingestion";
 import { scoreSubredditRelevance } from "./relevance-scorer";
 
+// ─── Tuning constants ────────────────────────────────────────────────────────
+
+/** Seeds inserted per cron run (no Reddit API — just DB writes, very fast) */
+const SEEDS_PER_RUN = 5;
+
+/** Max fetchAbout() calls during discovery (each = 1 Reddit API call) */
+const MAX_ABOUT_CALLS = 2;
+
+/** Flat list of all seed subreddit names */
+const ALL_SEEDS = Object.values(SEED_SUBREDDITS).flat();
+
+/** Search terms rotated each run */
+const SEARCH_TERMS = [
+  "fitness motivation",
+  "healthy lifestyle",
+  "self improvement",
+  "workout community",
+  "mental wellness",
+  "nutrition tips",
+  "gym beginner",
+  "weight loss journey",
+  "bodyweight training",
+  "running community",
+];
+
+// ─── Types ───────────────────────────────────────────────────────────────────
+
 export interface DiscoveryResult {
+  phase: "seed" | "discover" | "prune-only";
   seeded: number;
   discovered: number;
   pruned: number;
@@ -26,133 +58,131 @@ export interface DiscoveryResult {
   duration: number;
 }
 
+// ─── Phase A: Seed ───────────────────────────────────────────────────────────
+
 /**
- * Ensure seed subreddits exist in DB.
+ * Insert up to SEEDS_PER_RUN missing seed subreddits.
+ * No Reddit API calls — metadata will be filled lazily by ingestion.
+ * Returns the number inserted.
  */
-async function ensureSeeds(): Promise<number> {
-  let seeded = 0;
+async function seedNext(): Promise<number> {
+  const existing = await prisma.subreddit.findMany({
+    where: { isSeed: true },
+    select: { name: true },
+  });
+  const existingNames = new Set(existing.map((s: { name: string }) => s.name));
 
-  for (const [, subs] of Object.entries(SEED_SUBREDDITS)) {
-    for (const name of subs) {
-      const existing = await prisma.subreddit.findUnique({
-        where: { name: name.toLowerCase() },
+  const missing = ALL_SEEDS
+    .map((n) => n.toLowerCase())
+    .filter((n) => !existingNames.has(n));
+
+  if (missing.length === 0) return 0;
+
+  const batch = missing.slice(0, SEEDS_PER_RUN);
+  let inserted = 0;
+
+  for (const name of batch) {
+    try {
+      await prisma.subreddit.create({
+        data: {
+          name,
+          displayName: `r/${name}`,
+          description: "",
+          subscribers: 0,
+          activeUsers: 0,
+          relevanceScore: 80,
+          isActive: true,
+          isSeed: true,
+        },
       });
-
-      if (!existing) {
-        const about = await fetchSubredditAbout(name);
-        await prisma.subreddit.create({
-          data: {
-            name: name.toLowerCase(),
-            displayName: about?.displayName ?? `r/${name}`,
-            description: about?.description ?? "",
-            subscribers: about?.subscribers ?? 0,
-            activeUsers: about?.activeUsers ?? 0,
-            relevanceScore: 80, // Seeds get a high base score
-            isActive: true,
-            isSeed: true,
-          },
-        });
-        seeded++;
-      }
+      inserted++;
+    } catch {
+      // Already exists — race condition, skip
     }
   }
 
-  return seeded;
+  return inserted;
 }
 
+// ─── Phase B: Discover ───────────────────────────────────────────────────────
+
 /**
- * Discover new subreddits by searching Reddit for terms related to our domains.
+ * Run one search term, score candidates, save relevant ones.
+ * MAX_ABOUT_CALLS limits Reddit API usage to stay within 10s.
  */
-async function discoverNewSubreddits(): Promise<number> {
-  // Get existing names to avoid duplicates
+async function discoverOne(searchTermIndex: number): Promise<number> {
+  const term = SEARCH_TERMS[searchTermIndex % SEARCH_TERMS.length];
+
   const existing = await prisma.subreddit.findMany({
     select: { name: true },
   });
   const existingNames = new Set(existing.map((s: { name: string }) => s.name));
 
-  // Search terms derived from top-performing subreddits + seed domains
-  const topSubs = await prisma.subreddit.findMany({
-    where: { isActive: true },
-    orderBy: { relevanceScore: "desc" },
-    take: 5,
-    select: { name: true, description: true },
-  });
+  const results = await searchSubreddits(term, 15);
 
-  const searchTerms = [
-    ...topSubs.map((s: { name: string }) => s.name),
-    ...Object.keys(SEED_SUBREDDITS),
-    // Cross-domain search terms
-    "fitness motivation",
-    "healthy lifestyle",
-    "self improvement tips",
-    "workout community",
-    "mental wellness",
-  ];
+  // Pre-score all results using search data only (no extra API calls yet)
+  const candidates = results
+    .map((r) => ({
+      ...r,
+      name: r.name.toLowerCase(),
+      score: scoreSubredditRelevance({
+        name: r.name.toLowerCase(),
+        subscribers: r.subscribers,
+        activeUsers: 0,
+        description: r.description,
+      }),
+    }))
+    .filter(
+      (r) =>
+        r.name.length >= 2 &&
+        !existingNames.has(r.name) &&
+        r.score >= MIN_RELEVANCE_SCORE
+    )
+    .sort((a, b) => b.score - a.score)
+    .slice(0, MAX_ABOUT_CALLS); // Only fetch about for the top N
 
   let discovered = 0;
 
-  // Only search a few terms per run to stay within rate limits
-  const termsThisRun = searchTerms.slice(0, 3);
+  for (const candidate of candidates) {
+    const about = await fetchSubredditAbout(candidate.name);
 
-  for (const term of termsThisRun) {
-    const results = await searchSubreddits(term, 10);
+    const finalScore = about
+      ? scoreSubredditRelevance({
+          name: candidate.name,
+          subscribers: about.subscribers,
+          activeUsers: about.activeUsers,
+          description: about.description,
+        })
+      : candidate.score;
 
-    for (const r of results) {
-      const normalizedName = r.name.toLowerCase();
-      if (existingNames.has(normalizedName)) continue;
-      if (!normalizedName || normalizedName.length < 2) continue;
+    if (finalScore < MIN_RELEVANCE_SCORE) continue;
 
-      const score = scoreSubredditRelevance({
-        name: normalizedName,
-        subscribers: r.subscribers,
-        activeUsers: 0, // Not available from search
-        description: r.description,
+    try {
+      await prisma.subreddit.create({
+        data: {
+          name: candidate.name,
+          displayName: about?.displayName ?? `r/${candidate.name}`,
+          description: (about?.description ?? candidate.description).slice(0, 500),
+          subscribers: about?.subscribers ?? candidate.subscribers,
+          activeUsers: about?.activeUsers ?? 0,
+          relevanceScore: finalScore,
+          isActive: true,
+          isSeed: false,
+        },
       });
-
-      if (score < MIN_RELEVANCE_SCORE) continue;
-
-      // Fetch full about for active user count
-      const about = await fetchSubredditAbout(normalizedName);
-      const finalScore = about
-        ? scoreSubredditRelevance({
-            name: normalizedName,
-            subscribers: about.subscribers,
-            activeUsers: about.activeUsers,
-            description: about.description,
-          })
-        : score;
-
-      if (finalScore < MIN_RELEVANCE_SCORE) continue;
-
-      try {
-        await prisma.subreddit.create({
-          data: {
-            name: normalizedName,
-            displayName: about?.displayName ?? `r/${normalizedName}`,
-            description: (about?.description ?? r.description).slice(0, 500),
-            subscribers: about?.subscribers ?? r.subscribers,
-            activeUsers: about?.activeUsers ?? 0,
-            relevanceScore: finalScore,
-            isActive: true,
-            isSeed: false,
-          },
-        });
-        existingNames.add(normalizedName);
-        discovered++;
-      } catch {
-        // Unique constraint or other error — skip
-      }
+      existingNames.add(candidate.name);
+      discovered++;
+    } catch {
+      // Unique constraint — skip
     }
   }
 
   return discovered;
 }
 
-/**
- * Prune low-performing subreddits and enforce max active limit.
- */
+// ─── Phase C: Prune ──────────────────────────────────────────────────────────
+
 async function pruneSubreddits(): Promise<number> {
-  // Deactivate non-seed subreddits with very low relevance
   const pruned = await prisma.subreddit.updateMany({
     where: {
       isSeed: false,
@@ -162,7 +192,6 @@ async function pruneSubreddits(): Promise<number> {
     data: { isActive: false },
   });
 
-  // If still over limit, deactivate lowest-scoring non-seeds
   const activeCount = await prisma.subreddit.count({ where: { isActive: true } });
   if (activeCount > MAX_ACTIVE_SUBREDDITS) {
     const excess = activeCount - MAX_ACTIVE_SUBREDDITS;
@@ -185,21 +214,58 @@ async function pruneSubreddits(): Promise<number> {
   return pruned.count;
 }
 
-/**
- * Run the full discovery cycle.
- */
+// ─── Cursor helpers ──────────────────────────────────────────────────────────
+// We store the discovery search-term index in a dedicated row in IngestionCursor
+// using id = "discovery" to avoid colliding with ingestion's "singleton".
+
+async function getDiscoveryOffset(): Promise<number> {
+  const row = await prisma.ingestionCursor.upsert({
+    where: { id: "discovery" },
+    create: { id: "discovery", offset: 0 },
+    update: {},
+  });
+  return row.offset;
+}
+
+async function advanceDiscoveryOffset(current: number) {
+  await prisma.ingestionCursor.update({
+    where: { id: "discovery" },
+    data: {
+      offset: (current + 1) % SEARCH_TERMS.length,
+      lastRunAt: new Date(),
+    },
+  });
+}
+
+// ─── Main ────────────────────────────────────────────────────────────────────
+
 export async function runDiscovery(): Promise<DiscoveryResult> {
   const start = Date.now();
 
-  const seeded = await ensureSeeds();
-  const discovered = await discoverNewSubreddits();
+  // Phase A — seed missing seeds first (fast, no Reddit calls)
+  const seeded = await seedNext();
+
+  let discovered = 0;
+  let phase: DiscoveryResult["phase"] = "prune-only";
+
+  if (seeded > 0) {
+    // This run was a seeding run — don't also hit Reddit for discovery
+    phase = "seed";
+  } else {
+    // All seeds exist — do one discovery search
+    phase = "discover";
+    const offset = await getDiscoveryOffset();
+    discovered = await discoverOne(offset);
+    await advanceDiscoveryOffset(offset);
+  }
+
+  // Phase C — prune (pure DB, always fast)
   const pruned = await pruneSubreddits();
 
-  const totalActive = await prisma.subreddit.count({
-    where: { isActive: true },
-  });
+  const totalActive = await prisma.subreddit.count({ where: { isActive: true } });
 
   return {
+    phase,
     seeded,
     discovered,
     pruned,
@@ -207,7 +273,4 @@ export async function runDiscovery(): Promise<DiscoveryResult> {
     duration: Date.now() - start,
   };
 }
-
-
-
 
