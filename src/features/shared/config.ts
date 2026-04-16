@@ -17,7 +17,13 @@ export const SEED_SUBREDDITS: Record<string, string[]> = {
 };
 
 export const REDDIT_BASE_URL = "https://www.reddit.com";
-export const REDDIT_USER_AGENT = "TrendForge/2.0 (public read-only; github.com/trendforge)";
+
+/**
+ * User-Agent MUST follow Reddit's required format:
+ * <platform>:<app_id>:<version> (by /u/<reddit_username>)
+ * Set REDDIT_USERNAME in env to personalise; defaults to a generic value.
+ */
+export const REDDIT_USER_AGENT = `web:trendforge:v2.0 (by /u/${process.env.REDDIT_USERNAME ?? "trendforgebot"})`;
 
 /** Max subreddits to fetch per cron invocation (Vercel 10s limit) */
 export const INGESTION_BATCH_SIZE = 5;
@@ -36,4 +42,3 @@ export const TOP_TRENDING_COUNT = 40;
 
 /** HuggingFace analysis limit */
 export const HF_ANALYSIS_LIMIT = 40;
-
