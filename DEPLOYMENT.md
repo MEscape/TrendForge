@@ -11,32 +11,26 @@ docker compose up -d
 `.env` lokal:
 ```env
 DATABASE_URL="postgresql://trendforge:trendforge@localhost:5432/trendforge?schema=public"
-CRON_SECRET="dein-sicheres-geheimnis"
+CRON_SECRET="dein-sicheres-geheimnis-min32zeichen"
 HF_ACCESS_TOKEN="hf_..."
 NEXT_PUBLIC_BASE_URL="http://localhost:3000"
 ```
 
-> **Prisma 7 Hinweis:** Die `DATABASE_URL` wird per `prisma.config.ts` übergeben — nicht per `datasource url` im Schema.
-
-### 2. Prisma-Config für lokale DB
-
-`prisma.config.ts` ist bereits mit `dotenv/config` konfiguriert. Die URL aus `.env` wird automatisch geladen.
-
-### 3. Schema deployen
+### 2. Schema deployen
 
 ```bash
+# Schema direkt pushen (kein Migration-History, ideal für Entwicklung)
 npx prisma db push
-# oder für Migration:
+
+# Oder mit Migration-History (empfohlen für Production):
 npx prisma migrate dev --name init
 ```
 
-### 4. Prisma Client generieren
+> **Prisma 7 Architektur:** Die `DATABASE_URL` im Schema ist entfernt.  
+> Für die CLI (`prisma migrate`, `db push`) → `prisma.config.ts`  
+> Für den Runtime-Client → `@prisma/adapter-pg` mit `DATABASE_URL` aus `.env`
 
-```bash
-npx prisma generate
-```
-
-### 5. Dev-Server starten
+### 3. Dev-Server starten
 
 ```bash
 npm run dev
@@ -44,120 +38,159 @@ npm run dev
 
 ---
 
-## Vercel-Deployment mit Prisma
+## Vercel-Deployment
 
-### Datenbank: Neon (empfohlen — kostenlos, serverless)
+### Voraussetzung: PostgreSQL-Datenbank
 
+**Neon (empfohlen — kostenlos, serverless):**
 1. Account auf [neon.tech](https://neon.tech) erstellen
-2. Neues Projekt erstellen → Connection String kopieren (Format: `postgresql://...`)
+2. Neues Projekt → **Connection String** kopieren → "Pooled connection" aktivieren
 
-Alternativ: **Supabase** → Settings → Database → Connection String (Transaction Pooler für Serverless!)
+Connection String Format:
+```
+postgresql://user:pass@ep-xxx.us-east-2.aws.neon.tech/neondb?sslmode=require
+```
+
+**Supabase (Alternative):**  
+Settings → Database → Connection String → **Transaction Pooler** (für Serverless zwingend)
 
 ---
 
-### Schritt-für-Schritt Deployment
+### Schritt-für-Schritt
 
-#### 1. Vercel-Projekt erstellen
+#### 1. Repo auf GitHub pushen
 
 ```bash
-npm i -g vercel
-vercel
+git add .
+git commit -m "feat: initial trendforge architecture"
+git push
 ```
 
-Oder direkt im [Vercel Dashboard](https://vercel.com) → "Add New Project" → GitHub-Repo verbinden.
+#### 2. Vercel-Projekt anlegen
 
-#### 2. Environment Variables in Vercel setzen
+Im [Vercel Dashboard](https://vercel.com):
+- "Add New Project" → GitHub-Repo auswählen → Import
 
-Im Vercel Dashboard → Projekt → **Settings → Environment Variables**:
+#### 3. Environment Variables in Vercel setzen
 
-| Variable | Wert | Umgebungen |
+Vercel Dashboard → Projekt → **Settings → Environment Variables**:
+
+| Variable | Beispielwert | Wo |
 |---|---|---|
-| `DATABASE_URL` | `postgresql://user:pass@host/db?sslmode=require` | Production, Preview |
-| `CRON_SECRET` | zufälliger String (min. 32 Zeichen) | Production, Preview |
-| `HF_ACCESS_TOKEN` | `hf_...` von huggingface.co | Production, Preview |
+| `DATABASE_URL` | `postgresql://user:pass@host/db?sslmode=require` | Production + Preview |
+| `CRON_SECRET` | `openssl rand -hex 32` Ausgabe | Production + Preview |
+| `HF_ACCESS_TOKEN` | `hf_...` von [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) | Production + Preview |
 | `NEXT_PUBLIC_BASE_URL` | `https://deine-domain.vercel.app` | Production |
 
-> ⚠️ **Wichtig für Neon/Supabase:** Connection String muss `?sslmode=require` oder `?pgbouncer=true&connection_limit=1` enthalten für Serverless-Kompatibilität.
+> ⚠️ **Wichtig:** `DATABASE_URL` muss **auch im Build-Environment** gesetzt sein (Vercel setzt alle Env Vars standardmäßig für Build + Runtime).
 
-#### 3. Prisma in Vercel Build konfigurieren
+#### 4. Build Command
 
-`package.json` — Build-Script anpassen:
-
+`vercel.json` enthält bereits:
 ```json
-{
-  "scripts": {
-    "build": "prisma generate && next build"
-  }
-}
+{ "buildCommand": "prisma generate && next build" }
 ```
 
-> `prisma generate` muss **vor** `next build` laufen damit der Prisma Client im Build enthalten ist.
+`prisma generate` erzeugt den Prisma Client mit dem `@prisma/adapter-pg` — muss **vor** `next build` laufen.
 
-#### 4. Deployen
+#### 5. Schema auf Production-DB deployen
+
+Einmalig nach dem ersten Deployment oder bei Schemaänderungen:
+
+```bash
+# Lokal gegen Production-DB (DATABASE_URL auf Neon-URL setzen):
+DATABASE_URL="postgresql://..." npx prisma migrate deploy
+```
+
+Oder automatisiert via GitHub Actions (siehe unten).
+
+#### 6. Deployen
 
 ```bash
 vercel --prod
+# oder: Git-Push auf main triggert Auto-Deploy
 ```
 
 ---
 
-### Vercel Cron Jobs (via `vercel.json`)
+## Cron-Jobs mit cron-job.org
 
-Die `vercel.json` ist bereits konfiguriert:
+Da Vercel Free Plan keine häufigen Crons unterstützt, nutzen wir **cron-job.org** (kostenlos, unbegrenzt).
 
-```json
-{
-  "crons": [
-    { "path": "/api/cron/discover", "schedule": "0 */12 * * *" },
-    { "path": "/api/cron/ingest",   "schedule": "*/15 * * * *" },
-    { "path": "/api/cron/process",  "schedule": "*/30 * * * *" }
-  ]
-}
-```
+### Setup
 
-> **Vercel Free Plan Einschränkung:** Cron Jobs sind auf dem Free Plan auf **1 Cron pro Deployment** und **täglich** begrenzt. Auf dem **Hobby Plan ($0)** sind Crons alle 60 Minuten möglich. Für häufigere Ausführung (alle 15 Min) wird der **Pro Plan** benötigt — oder ein **externer Ping-Service**.
-
-#### Externer Cron-Ersatz (kostenlos, Free Plan kompatibel)
-
-**Option A — cron-job.org (empfohlen):**
-1. [cron-job.org](https://cron-job.org) → Account erstellen
-2. Drei Cron Jobs anlegen:
-   - URL: `https://deine-domain.vercel.app/api/cron/discover` — alle 12h
-   - URL: `https://deine-domain.vercel.app/api/cron/ingest` — alle 15 Min
-   - URL: `https://deine-domain.vercel.app/api/cron/process` — alle 30 Min
-3. Header hinzufügen: `Authorization: Bearer <CRON_SECRET>`
-
-**Option B — UptimeRobot:**
-- Monitor-Typ: HTTP(S), Intervall: 5 Min (Minimum)
-- URL: `https://deine-domain.vercel.app/api/cron/ingest`
-- Custom Header: `Authorization: Bearer <CRON_SECRET>`
+1. Account auf [cron-job.org](https://cron-job.org) erstellen
+2. Dashboard → **"Create cronjob"**
+3. Drei Jobs anlegen:
 
 ---
 
-### Cron-Endpunkte manuell testen
+**Job 1 — Subreddit Discovery** (alle 12 Stunden reicht)
+
+| Feld | Wert |
+|---|---|
+| URL | `https://DEINE-DOMAIN.vercel.app/api/cron/discover` |
+| Schedule | `0 */12 * * *` (alle 12h) |
+| Request Method | `GET` |
+| Headers | `Authorization: Bearer DEIN_CRON_SECRET` |
+
+---
+
+**Job 2 — Reddit Ingestion** (alle 15 Minuten)
+
+| Feld | Wert |
+|---|---|
+| URL | `https://DEINE-DOMAIN.vercel.app/api/cron/ingest` |
+| Schedule | `*/15 * * * *` |
+| Request Method | `GET` |
+| Headers | `Authorization: Bearer DEIN_CRON_SECRET` |
+
+---
+
+**Job 3 — Content Processing** (alle 30 Minuten)
+
+| Feld | Wert |
+|---|---|
+| URL | `https://DEINE-DOMAIN.vercel.app/api/cron/process` |
+| Schedule | `*/30 * * * *` |
+| Request Method | `GET` |
+| Headers | `Authorization: Bearer DEIN_CRON_SECRET` |
+
+---
+
+### Custom Header in cron-job.org eintragen
+
+Im Job-Editor: **"Advanced"** → **"Custom request headers"**:
+```
+Authorization: Bearer dein-cron-secret-hier
+```
+
+### Manuell testen (lokal)
 
 ```bash
-# Lokal
-curl -H "Authorization: Bearer $CRON_SECRET" http://localhost:3000/api/cron/discover
-curl -H "Authorization: Bearer $CRON_SECRET" http://localhost:3000/api/cron/ingest
-curl -H "Authorization: Bearer $CRON_SECRET" http://localhost:3000/api/cron/process
+# .env Werte laden und testen:
+curl -H "Authorization: Bearer $(grep CRON_SECRET .env | cut -d= -f2 | tr -d '\"')" \
+  http://localhost:3000/api/cron/discover
 
-# Produktion
-curl -H "Authorization: Bearer $CRON_SECRET" https://deine-domain.vercel.app/api/cron/discover
+curl -H "Authorization: Bearer $(grep CRON_SECRET .env | cut -d= -f2 | tr -d '\"')" \
+  http://localhost:3000/api/cron/ingest
+```
+
+### Manuell testen (Produktion)
+
+```bash
+CRON_SECRET="dein-secret"
+BASE="https://deine-domain.vercel.app"
+
+curl -H "Authorization: Bearer $CRON_SECRET" $BASE/api/cron/discover
+curl -H "Authorization: Bearer $CRON_SECRET" $BASE/api/cron/ingest
+curl -H "Authorization: Bearer $CRON_SECRET" $BASE/api/cron/process
+curl $BASE/api/status
 ```
 
 ---
 
-### Prisma Migrations in CI/CD
-
-Für Production-Migrations empfiehlt sich ein separater Schritt:
-
-```bash
-# Einmalig / bei Schemaänderungen:
-npx prisma migrate deploy
-```
-
-In Vercel kannst du dies als Post-Build-Command in den Vercel Settings eintragen oder via GitHub Actions:
+## Prisma Migrations in CI/CD (optional)
 
 ```yaml
 # .github/workflows/migrate.yml
@@ -181,17 +214,22 @@ jobs:
 
 ---
 
-### Troubleshooting
+## Troubleshooting
 
-**Prisma Client nicht gefunden im Build:**
-→ Sicherstellen dass `prisma generate` im Build-Script vor `next build` steht.
+**Build schlägt fehl: "DATABASE_URL is not set"**  
+→ In Vercel: Settings → Environment Variables → sicherstellen dass `DATABASE_URL` für **alle** Environments gesetzt ist (Production + Preview + Development).
 
-**Connection Timeout auf Vercel:**
-→ Neon/Supabase Pooler-URL verwenden (`?pgbouncer=true&connection_limit=1`) oder Prisma Accelerate.
+**Build schlägt fehl: Prisma Client error**  
+→ `vercel.json` `buildCommand` enthält `prisma generate && next build`? Nach Schemaänderungen immer neu generieren.
 
-**429 von Reddit:**
-→ Cron-Intervall erhöhen; der Token-Bucket Rate Limiter drosselt automatisch, aber bei zu häufigen Aufrufen hilft nur weniger Frequenz.
+**Prisma 7: `adapter` Pflicht**  
+→ `new PrismaClient()` ohne `adapter` wirft in Prisma 7 wenn kein `url` im Schema. Das Projekt nutzt `@prisma/adapter-pg` — bereits konfiguriert in `src/lib/db.ts`.
 
-**`CRON_SECRET` nicht gesetzt:**
-→ Im Dev-Modus wird der Cron-Endpunkt ohne Secret zugelassen; in Production schlägt er fehl. Immer setzen!
+**Connection Timeout auf Vercel**  
+→ Neon Pooled Connection URL verwenden (nicht Direct Connection). Supabase: Transaction Pooler Port 6543.
 
+**cron-job.org 401 Unauthorized**  
+→ Header exakt prüfen: `Authorization: Bearer <secret>` — kein Leerzeichen, kein Zeilenumbruch im Secret.
+
+**429 von Reddit**  
+→ Cron-Intervall für `/api/cron/ingest` erhöhen (z.B. alle 30 Min statt 15). Der Token-Bucket Rate Limiter drosselt automatisch, aber serverseitige Reddit-Limits gelten trotzdem.

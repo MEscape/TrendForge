@@ -75,6 +75,14 @@
             </PendingDiffInfo>
           </value>
         </entry>
+        <entry key="/vercel (snapshot).json">
+          <value>
+            <PendingDiffInfo>
+              <option name="filePath" value="/vercel (snapshot).json" />
+              <option name="updatedContent" value="{&#10;  &quot;buildCommand&quot;: &quot;prisma generate &amp;&amp; next build&quot;&#10;}&#10;" />
+            </PendingDiffInfo>
+          </value>
+        </entry>
       </map>
     </option>
   </component>
