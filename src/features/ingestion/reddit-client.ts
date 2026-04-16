@@ -6,7 +6,7 @@
  */
 
 import { redditRateLimiter } from "@/features/shared";
-import { REDDIT_BASE_URL, REDDIT_USER_AGENT } from "@/features/shared/config";
+import { REDDIT_BASE_URL } from "@/features/shared/config";
 
 interface RedditListingResponse {
   kind: "Listing";
@@ -52,12 +52,24 @@ export interface RawRedditPost {
 const MAX_RETRIES = 2;
 const RETRY_DELAY_MS = 2000;
 
+/**
+ * Reddit's public JSON API blocks server-side requests that look like bots.
+ * Mimicking a real browser User-Agent + Accept headers prevents 403s.
+ */
+const BROWSER_HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+  "Accept-Language": "en-US,en;q=0.9",
+  "Accept-Encoding": "gzip, deflate, br",
+};
+
 async function fetchWithRetry(url: string): Promise<Response> {
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     await redditRateLimiter.acquire();
 
     const res = await fetch(url, {
-      headers: { "User-Agent": REDDIT_USER_AGENT },
+      headers: BROWSER_HEADERS,
       signal: AbortSignal.timeout(8000),
     });
 
