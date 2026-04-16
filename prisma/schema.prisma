@@ -1,0 +1,108 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─── Subreddit Discovery ─────────────────────────────────────────────────────
+
+model Subreddit {
+  id              String   @id @default(cuid())
+  name            String   @unique /// e.g. "fitness" (without r/)
+  displayName     String?
+  description     String?
+  subscribers     Int      @default(0)
+  activeUsers     Int      @default(0)
+  relevanceScore  Float    @default(0) /// AI/heuristic computed score 0-100
+  isActive        Boolean  @default(true) /// Whether to include in ingestion
+  isSeed          Boolean  @default(false) /// Manually seeded vs discovered
+  lastFetchedAt   DateTime?
+  discoveredAt    DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  posts RedditPost[]
+
+  @@index([isActive, relevanceScore])
+  @@index([lastFetchedAt])
+}
+
+// ─── Reddit Posts ────────────────────────────────────────────────────────────
+
+enum PostStatus {
+  INGESTED
+  SCORED
+  CLASSIFIED
+  PROCESSED
+  DISCARDED
+}
+
+model RedditPost {
+  id            String     @id /// Reddit post ID (e.g. "abc123")
+  title         String
+  selftext      String     @default("")
+  author        String
+  upvotes       Int        @default(0)
+  comments      Int        @default(0)
+  permalink     String
+  url           String
+  flair         String?
+  isNsfw        Boolean    @default(false)
+  createdAtUtc  DateTime   /// Reddit created_utc as DateTime
+  status        PostStatus @default(INGESTED)
+
+  trendScore      Float?
+  engagementRate  Float?
+  ageHours        Float?
+
+  subredditName String
+  subreddit     Subreddit @relation(fields: [subredditName], references: [name])
+
+  processedData ProcessedPost?
+
+  ingestedAt DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([status])
+  @@index([subredditName])
+  @@index([createdAtUtc])
+  @@index([trendScore])
+}
+
+// ─── Processing Output ───────────────────────────────────────────────────────
+
+model ProcessedPost {
+  id        String @id @default(cuid())
+  postId    String @unique
+  post      RedditPost @relation(fields: [postId], references: [id])
+
+  topicLabel  String?
+  confidence  Float?
+  emotions    Json?
+
+  contentIdea Json?
+
+  viralityScore     Float?
+  viralityBreakdown Json?
+
+  processedAt DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([topicLabel])
+  @@index([viralityScore])
+}
+
+// ─── Ingestion Cursor ────────────────────────────────────────────────────────
+
+model IngestionCursor {
+  id        String   @id @default("singleton")
+  offset    Int      @default(0)
+  lastRunAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
